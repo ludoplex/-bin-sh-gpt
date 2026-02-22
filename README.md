@@ -171,3 +171,12 @@ Contributions are very welcome!
 If you have ideas or need help to get started join the [Discord server](https://discord.gg/fwfYAZWKqu)
 
 ![Discord](https://img.shields.io/discord/1090696025162928158?label=Discord&style=for-the-badge)
+
+## Unix-native skills and MCP (no Node.js)
+
+This project now supports a Unix-first workflow:
+- Local skills from plain files (`skills`, `skill:<name>`, `--skills-dir`)
+- MCP-style local IPC over Unix sockets (`--mcp-socket`, `mcp:<payload>`)
+- OpenClaw-style terminal-first prompting (`--openclaw-mode`)
+
+See `docs_unix_mcp.md` for architecture guidance on daemons, IPC, and isolation via chroot/jails/QEMU/KVM/bhyve.

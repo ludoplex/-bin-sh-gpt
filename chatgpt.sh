@@ -7,10 +7,16 @@ CHAT_INIT_PROMPT="You are ChatGPT, a Large Language Model trained by OpenAI. You
 SYSTEM_PROMPT="You are ChatGPT, a large language model trained by OpenAI. Answer as concisely as possible. Current date: $(date +%m/%d/%Y). Knowledge cutoff: 9/1/2021."
 
 COMMAND_GENERATION_PROMPT="You are a Command Line Interface expert and your task is to provide functioning shell commands. Return a CLI command and nothing else - do not send it in a code block, quotes, or anything else, just the pure text CONTAINING ONLY THE COMMAND. If possible, return a one-line bash command or chain many commands together. Return ONLY the command ready to run in the terminal. The command should do the following:"
+OPENCLAW_CAPABILITY_PROMPT="You are operating in an OpenClaw-like Unix-native mode. Prefer coherent Unix workflows and native concepts first: shell pipelines, terminal sessions, filesystems, process management, and daemon/service configuration. When asked for an action plan, break work into concrete terminal-first steps and include verification commands."
 
 CHATGPT_CYAN_LABEL="\033[36mchatgpt \033[0m"
 PROCESSING_LABEL="\n\033[90mProcessing... \033[0m\033[0K\r"
 OVERWRITE_PROCESSING_LINE="             \033[0K\r"
+OPENCLAW_MODE=false
+OPENCLAW_CONFIG_FILE=""
+SKILLS_DIR="${HOME}/.chatgpt/skills"
+ACTIVE_SKILLS=""
+MCP_SOCKET=""
 
 if [[ -z "$OPENAI_KEY" ]]; then
 	echo "You need to set your OPENAI_KEY to use this script"
@@ -29,6 +35,9 @@ By default the script uses the "gpt-3.5-turbo" model. It will upgrade to "gpt-4"
 Commands:
   image: - To generate images, start a prompt with image: If you are using iTerm, you can view the image directly in the terminal. Otherwise the script will ask to open the image in your browser.
   history - To view your chat history
+  skills - List local skill files from --skills-dir
+  skill:<name> - Activate a local skill file for this session
+  mcp:<payload> - Send a payload to a local MCP Unix socket daemon
   models - To get a list of the models available at OpenAI API
   model: - To view all the information on a specific model, start a prompt with model: and the model id as it appears in the list of models. For example: "model:text-babbage:001" will get you all the fields for text-babbage:001 model
   command: - To get a command with the specified functionality and run it, just type "command:" and explain what you want to achieve. The script will always ask you if you want to execute the command. i.e. 
@@ -64,6 +73,17 @@ Options:
                              its previous answers. It also makes models
                              aware of todays date and what data it was trained
                              on.
+
+  --openclaw-mode            Enable Unix-native terminal-first assistant mode.
+
+  --openclaw-config          Path to a local config/context file to inject
+                             into the system prompt when openclaw mode is on.
+
+  --skills-dir               Directory containing local skill text/markdown
+                             files (default: ~/.chatgpt/skills)
+
+  --mcp-socket               Unix domain socket used for MCP-style local IPC
+                             with external agent/tool daemons.
 
 EOF
 }
@@ -157,6 +177,94 @@ build_chat_context() {
 
 escape() {
 	echo "$1" | jq -Rrs 'tojson[1:-1]'
+}
+
+
+apply_openclaw_prompt() {
+	if [ "$OPENCLAW_MODE" != true ]; then
+		return
+	fi
+
+	local shell_name="${SHELL##*/}"
+	local os_name="${OSTYPE:-unknown}"
+	local context="${OPENCLAW_CAPABILITY_PROMPT}\nRuntime context:\n- cwd: ${PWD}\n- shell: ${shell_name}\n- user: ${USER:-unknown}\n- host: ${HOSTNAME:-unknown}\n- os: ${os_name}"
+
+	if [ -n "$OPENCLAW_CONFIG_FILE" ] && [ -r "$OPENCLAW_CONFIG_FILE" ]; then
+		local config_content
+		config_content=$(<"$OPENCLAW_CONFIG_FILE")
+		context+="\n\nOperator config:\n${config_content}"
+	fi
+
+	SYSTEM_PROMPT="${SYSTEM_PROMPT}\n\n${context}"
+}
+
+print_response_text() {
+	local response_text="$1"
+	echo -e "$OVERWRITE_PROCESSING_LINE"
+	if command -v glow &>/dev/null; then
+		echo -e "${CHATGPT_CYAN_LABEL}"
+		echo "${response_text}" | glow -
+	else
+		echo -e "${CHATGPT_CYAN_LABEL}${response_text}" | fold -s -w "${COLUMNS:-80}"
+	fi
+}
+
+append_history_entry() {
+	local user_prompt="$1"
+	local assistant_reply="$2"
+	printf '%s %s \n%s \n\n' "$(date +"%Y-%m-%d %H:%M")" "$user_prompt" "$assistant_reply" >>~/.chatgpt_history
+}
+
+
+resolve_skill_file() {
+	local skill_name="$1"
+	local candidate
+	for candidate in "$SKILLS_DIR/$skill_name" "$SKILLS_DIR/$skill_name.md" "$SKILLS_DIR/$skill_name.txt"; do
+		if [ -r "$candidate" ]; then
+			echo "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+list_local_skills() {
+	if [ ! -d "$SKILLS_DIR" ]; then
+		echo -e "${CHATGPT_CYAN_LABEL}No skills directory found at $SKILLS_DIR"
+		return
+	fi
+
+	echo -e "${CHATGPT_CYAN_LABEL}Available local skills in $SKILLS_DIR:"
+	find "$SKILLS_DIR" -maxdepth 1 -type f \( -name '*.md' -o -name '*.txt' \) -printf '%f\n' | sed -E 's/\.(md|txt)$//' | sort -u
+}
+
+activate_skill() {
+	local skill_name="$1"
+	local skill_file
+	skill_file=$(resolve_skill_file "$skill_name") || return 1
+	local skill_content
+	skill_content=$(<"$skill_file")
+	SYSTEM_PROMPT="${SYSTEM_PROMPT}\n\nSkill (${skill_name}):\n${skill_content}"
+	ACTIVE_SKILLS="${ACTIVE_SKILLS}${ACTIVE_SKILLS:+, }${skill_name}"
+	echo -e "${CHATGPT_CYAN_LABEL}Activated skill: ${skill_name}"
+	return 0
+}
+
+send_mcp_message() {
+	local payload="$1"
+	if [ -z "$MCP_SOCKET" ]; then
+		echo -e "${CHATGPT_CYAN_LABEL}No MCP socket configured. Use --mcp-socket /path/to.sock" >&2
+		return 1
+	fi
+	if [ ! -S "$MCP_SOCKET" ]; then
+		echo -e "${CHATGPT_CYAN_LABEL}MCP socket not found: $MCP_SOCKET" >&2
+		return 1
+	fi
+	if ! command -v socat >/dev/null 2>&1; then
+		echo -e "${CHATGPT_CYAN_LABEL}socat is required for Unix socket MCP transport" >&2
+		return 1
+	fi
+	printf '%s\n' "$payload" | socat - UNIX-CONNECT:"$MCP_SOCKET"
 }
 
 # maintain chat context function for /completions (all models except
@@ -271,6 +379,26 @@ while [[ "$#" -gt 0 ]]; do
 		CONTEXT=true
 		shift
 		;;
+	--openclaw-mode)
+		OPENCLAW_MODE=true
+		shift
+		;;
+	--openclaw-config)
+		OPENCLAW_CONFIG_FILE="$2"
+		OPENCLAW_MODE=true
+		shift
+		shift
+		;;
+	--skills-dir)
+		SKILLS_DIR="$2"
+		shift
+		shift
+		;;
+	--mcp-socket)
+		MCP_SOCKET="$2"
+		shift
+		shift
+		;;
 	-h | --help)
 		usage
 		exit 0
@@ -281,6 +409,8 @@ while [[ "$#" -gt 0 ]]; do
 		;;
 	esac
 done
+
+apply_openclaw_prompt
 
 # set defaults
 TEMPERATURE=${TEMPERATURE:-0.7}
@@ -293,7 +423,7 @@ MULTI_LINE_PROMPT=${MULTI_LINE_PROMPT:-false}
 # create our temp file for multi-line input
 if [ $MULTI_LINE_PROMPT = true ]; then
 	USER_INPUT_TEMP_FILE=$(mktemp)
-	trap 'rm -f ${USER_INPUT}' EXIT
+	trap 'rm -f ${USER_INPUT_TEMP_FILE}' EXIT
 fi
 
 # create history file
@@ -322,7 +452,7 @@ while $running; do
 		if [ $MULTI_LINE_PROMPT = true ]; then
 			echo -e "\nEnter a prompt: (Press Enter then Ctrl-D to send)"
 			cat >"${USER_INPUT_TEMP_FILE}"
-			input_from_temp_file=$(cat "${USER_INPUT_TEMP_FILE}")
+			input_from_temp_file=$(<"${USER_INPUT_TEMP_FILE}")
 			prompt=$(escape "$input_from_temp_file")
 		else
 			echo -e "\nEnter a prompt:"
@@ -340,6 +470,20 @@ while $running; do
 
 	if [[ $prompt =~ ^(exit|q)$ ]]; then
 		running=false
+	elif [[ "$prompt" == "skills" ]]; then
+		list_local_skills
+	elif [[ "$prompt" =~ ^skill: ]]; then
+		skill_name="${prompt#*skill:}"
+		if ! activate_skill "$skill_name"; then
+			echo -e "${CHATGPT_CYAN_LABEL}Skill not found: ${skill_name}"
+		fi
+	elif [[ "$prompt" =~ ^mcp: ]]; then
+		mcp_payload="${prompt#mcp:}"
+		echo -e "$OVERWRITE_PROCESSING_LINE"
+		if mcp_response=$(send_mcp_message "$mcp_payload"); then
+			echo -e "${CHATGPT_CYAN_LABEL}${mcp_response}" | fold -s -w "${COLUMNS:-80}"
+			append_history_entry "$prompt" "$mcp_response"
+		fi
 	elif [[ "$prompt" =~ ^image: ]]; then
 		request_to_image "$prompt"
 		handle_error "$image_response"
@@ -348,11 +492,11 @@ while $running; do
 		echo -e "${CHATGPT_CYAN_LABEL}Your image was created. \n\nLink: ${image_url}\n"
 
 		if [[ "$TERM_PROGRAM" == "iTerm.app" ]]; then
-			curl -sS $image_url -o temp_image.png
+			curl -sS "$image_url" -o temp_image.png
 			imgcat temp_image.png
 			rm temp_image.png
 		elif [[ "$TERM" == "xterm-kitty" ]]; then
-			curl -sS $image_url -o temp_image.png
+			curl -sS "$image_url" -o temp_image.png
 			kitty +kitten icat temp_image.png
 			rm temp_image.png
 		else
@@ -363,7 +507,8 @@ while $running; do
 			fi
 		fi
 	elif [[ "$prompt" == "history" ]]; then
-		echo -e "\n$(cat ~/.chatgpt_history)"
+		echo
+		cat ~/.chatgpt_history
 	elif [[ "$prompt" == "models" ]]; then
 		list_models
 	elif [[ "$prompt" =~ ^model: ]]; then
@@ -386,7 +531,7 @@ while $running; do
 
 		if [[ "$prompt" =~ ^command: ]]; then
 			echo -e "$OVERWRITE_PROCESSING_LINE"
-			echo -e "${CHATGPT_CYAN_LABEL} ${response_data}" | fold -s -w $COLUMNS
+			echo -e "${CHATGPT_CYAN_LABEL} ${response_data}" | fold -s -w "${COLUMNS:-80}"
 			dangerous_commands=("rm" ">" "mv" "mkfs" ":(){:|:&};" "dd" "chmod" "wget" "curl")
 
 			for dangerous_command in "${dangerous_commands[@]}"; do
@@ -398,13 +543,12 @@ while $running; do
 			read run_answer
 			if [ "$run_answer" == "Yes" ] || [ "$run_answer" == "yes" ] || [ "$run_answer" == "y" ] || [ "$run_answer" == "Y" ]; then
 				echo -e "\nExecuting command: $response_data\n"
-				eval $response_data
+				eval "$response_data"
 			fi
 		fi
 		add_assistant_response_to_chat_message "$(escape "$response_data")"
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		append_history_entry "$prompt" "$response_data"
 
 	elif [[ "$MODEL" =~ ^gpt- ]]; then
 		# escape quotation marks, new lines, backslashes...
@@ -415,18 +559,10 @@ while $running; do
 		handle_error "$response"
 		response_data=$(echo "$response" | jq -r '.choices[].message.content')
 
-		echo -e "$OVERWRITE_PROCESSING_LINE"
-		# if glow installed, print parsed markdown
-		if command -v glow &>/dev/null; then
-			echo -e "${CHATGPT_CYAN_LABEL}"
-			echo "${response_data}" | glow -
-		else
-			echo -e "${CHATGPT_CYAN_LABEL}${response_data}" | fold -s -w "$COLUMNS"
-		fi
+		print_response_text "$response_data"
 		add_assistant_response_to_chat_message "$(escape "$response_data")"
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		append_history_entry "$prompt" "$response_data"
 	else
 		# escape quotation marks, new lines, backslashes...
 		request_prompt=$(escape "$prompt")
@@ -439,22 +575,13 @@ while $running; do
 		handle_error "$response"
 		response_data=$(echo "$response" | jq -r '.choices[].text')
 
-		echo -e "$OVERWRITE_PROCESSING_LINE"
-		# if glow installed, print parsed markdown
-		if command -v glow &>/dev/null; then
-			echo -e "${CHATGPT_CYAN_LABEL}"
-			echo "${response_data}" | glow -
-		else
-			# else remove empty lines and print
-			formatted_text=$(echo "${response_data}" | sed '1,2d; s/^A://g')
-			echo -e "${CHATGPT_CYAN_LABEL}${formatted_text}" | fold -s -w $COLUMNS
-		fi
+		formatted_text=$(echo "${response_data}" | sed '1,2d; s/^A://g')
+		print_response_text "$formatted_text"
 
 		if [ "$CONTEXT" = true ]; then
 			maintain_chat_context "$(escape "$response_data")"
 		fi
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		append_history_entry "$prompt" "$response_data"
 	fi
 done
