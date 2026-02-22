@@ -176,7 +176,8 @@ If you have ideas or need help to get started join the [Discord server](https://
 
 This project now supports a Unix-first workflow:
 - Local skills from plain files (`skills`, `skill:<name>`, `--skills-dir`)
-- MCP-style local IPC over Unix sockets (`--mcp-socket`, `mcp:<payload>`)
+- MCP-style local IPC over Unix sockets or FIFOs (`--mcp-socket`, `--mcp-fifo-dir`, `mcp:<payload>`)
 - OpenClaw-style terminal-first prompting (`--openclaw-mode`)
+- Runtime context introspection (`context`)
 
 See `docs_unix_mcp.md` for architecture guidance on daemons, IPC, and isolation via chroot/jails/QEMU/KVM/bhyve.

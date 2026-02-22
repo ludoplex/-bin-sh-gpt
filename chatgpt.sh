@@ -17,6 +17,9 @@ OPENCLAW_CONFIG_FILE=""
 SKILLS_DIR="${HOME}/.chatgpt/skills"
 ACTIVE_SKILLS=""
 MCP_SOCKET=""
+MCP_FIFO_DIR=""
+MCP_REQ_FIFO=""
+MCP_RESP_FIFO=""
 
 if [[ -z "$OPENAI_KEY" ]]; then
 	echo "You need to set your OPENAI_KEY to use this script"
@@ -84,6 +87,10 @@ Options:
 
   --mcp-socket               Unix domain socket used for MCP-style local IPC
                              with external agent/tool daemons.
+
+  --mcp-fifo-dir             Directory containing req.fifo and resp.fifo for
+                             MCP-style local FIFO IPC when Unix sockets are
+                             unavailable.
 
 EOF
 }
@@ -252,19 +259,47 @@ activate_skill() {
 
 send_mcp_message() {
 	local payload="$1"
-	if [ -z "$MCP_SOCKET" ]; then
-		echo -e "${CHATGPT_CYAN_LABEL}No MCP socket configured. Use --mcp-socket /path/to.sock" >&2
-		return 1
+	if [ -n "$MCP_SOCKET" ]; then
+		if [ ! -S "$MCP_SOCKET" ]; then
+			echo -e "${CHATGPT_CYAN_LABEL}MCP socket not found: $MCP_SOCKET" >&2
+			return 1
+		fi
+		if ! command -v socat >/dev/null 2>&1; then
+			echo -e "${CHATGPT_CYAN_LABEL}socat is required for Unix socket MCP transport" >&2
+			return 1
+		fi
+		printf '%s\n' "$payload" | socat - UNIX-CONNECT:"$MCP_SOCKET"
+		return $?
 	fi
-	if [ ! -S "$MCP_SOCKET" ]; then
-		echo -e "${CHATGPT_CYAN_LABEL}MCP socket not found: $MCP_SOCKET" >&2
-		return 1
+
+	if [ -n "$MCP_REQ_FIFO" ] && [ -n "$MCP_RESP_FIFO" ] && [ -p "$MCP_REQ_FIFO" ] && [ -p "$MCP_RESP_FIFO" ]; then
+		printf '%s\n' "$payload" >"$MCP_REQ_FIFO"
+		head -n 1 <"$MCP_RESP_FIFO"
+		return $?
 	fi
-	if ! command -v socat >/dev/null 2>&1; then
-		echo -e "${CHATGPT_CYAN_LABEL}socat is required for Unix socket MCP transport" >&2
-		return 1
+
+	echo -e "${CHATGPT_CYAN_LABEL}No MCP transport configured. Use --mcp-socket /path.sock or --mcp-fifo-dir /path" >&2
+	return 1
+}
+
+init_mcp_fifo_paths() {
+	if [ -z "$MCP_FIFO_DIR" ]; then
+		return
 	fi
-	printf '%s\n' "$payload" | socat - UNIX-CONNECT:"$MCP_SOCKET"
+	MCP_REQ_FIFO="$MCP_FIFO_DIR/req.fifo"
+	MCP_RESP_FIFO="$MCP_FIFO_DIR/resp.fifo"
+}
+
+show_unix_context() {
+	echo -e "${CHATGPT_CYAN_LABEL}Unix context"
+	echo "cwd=$PWD"
+	echo "shell=${SHELL##*/}"
+	echo "user=${USER:-unknown}"
+	echo "host=${HOSTNAME:-unknown}"
+	echo "skills_dir=$SKILLS_DIR"
+	echo "mcp_socket=${MCP_SOCKET:-unset}"
+	echo "mcp_fifo_dir=${MCP_FIFO_DIR:-unset}"
+	echo "active_skills=${ACTIVE_SKILLS:-none}"
 }
 
 # maintain chat context function for /completions (all models except
@@ -399,6 +434,11 @@ while [[ "$#" -gt 0 ]]; do
 		shift
 		shift
 		;;
+	--mcp-fifo-dir)
+		MCP_FIFO_DIR="$2"
+		shift
+		shift
+		;;
 	-h | --help)
 		usage
 		exit 0
@@ -411,6 +451,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 apply_openclaw_prompt
+init_mcp_fifo_paths
 
 # set defaults
 TEMPERATURE=${TEMPERATURE:-0.7}
@@ -453,7 +494,7 @@ while $running; do
 			echo -e "\nEnter a prompt: (Press Enter then Ctrl-D to send)"
 			cat >"${USER_INPUT_TEMP_FILE}"
 			input_from_temp_file=$(<"${USER_INPUT_TEMP_FILE}")
-			prompt=$(escape "$input_from_temp_file")
+			prompt="$input_from_temp_file"
 		else
 			echo -e "\nEnter a prompt:"
 			read -e prompt
@@ -472,6 +513,8 @@ while $running; do
 		running=false
 	elif [[ "$prompt" == "skills" ]]; then
 		list_local_skills
+	elif [[ "$prompt" == "context" ]]; then
+		show_unix_context
 	elif [[ "$prompt" =~ ^skill: ]]; then
 		skill_name="${prompt#*skill:}"
 		if ! activate_skill "$skill_name"; then
